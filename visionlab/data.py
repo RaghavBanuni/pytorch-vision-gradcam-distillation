@@ -18,6 +18,12 @@ with the true label is controlled by ``cue_strength``:
 * ``inverted`` - the tint systematically names the *wrong* class.  A model that learned the
   shape is unaffected; a model that learned the tint collapses below chance.
 
+The three test regimes are **paired**: they are rendered from the same :class:`Latent` values -
+same shapes, positions, rotations, colours and even the same noise draw - and differ only in
+the background tint.  That is deliberate.  If each regime were sampled independently, an
+accuracy gap between them would confound the cue with ordinary sampling noise, and the whole
+measurement would be weaker than it looks.
+
 Every sample also carries the tight bounding box of its shape, which is what makes the
 Grad-CAM pointing game possible.
 """
@@ -83,6 +89,24 @@ class ImageConfig:
             raise ValueError("object size fractions must satisfy 0 < min < max <= 0.9")
         if self.noise_std < 0:
             raise ValueError("noise_std must be non-negative")
+
+
+@dataclass(frozen=True)
+class Latent:
+    """Everything about one image *except* the background cue.
+
+    Keeping the latent state separate from the cue is what makes the three test regimes a
+    paired comparison: the same latents are rendered three times under three tints, so nothing
+    but the tint can explain a difference in accuracy.  ``noise_seed`` is stored rather than
+    the noise itself so the pairing survives without holding arrays in memory.
+    """
+
+    label: int
+    radius: float
+    centre: tuple[float, float]
+    angle: float
+    colour: int
+    noise_seed: int
 
 
 @dataclass(frozen=True)
@@ -165,40 +189,83 @@ def _bounding_box(mask: np.ndarray) -> tuple[int, int, int, int]:
     return int(columns[0]), int(rows[0]), int(columns[-1]), int(rows[-1])
 
 
-def _cue_for(label: int, mode: str, rng: np.random.Generator, config: ImageConfig) -> int:
-    if mode == "aligned":
-        if rng.random() < config.cue_strength:
-            return label
-        others = [index for index in range(len(CLASSES)) if index != label]
-        return int(rng.choice(others))
-    if mode == "random":
-        return int(rng.integers(len(CLASSES)))
-    if mode == "inverted":
-        return int((label + 1) % len(CLASSES))
-    raise ValueError(f"unknown cue mode {mode!r}; expected one of {CUE_MODES}")
+def sample_latents(count: int, config: ImageConfig, seed: int) -> list[Latent]:
+    """Sample the object state for one split, with classes balanced by construction.
+
+    The margin keeps every shape fully inside the frame, so a bounding box is always the true
+    extent of the object rather than a clipped guess.
+    """
+    config.validate()
+    if count < 1:
+        raise ValueError("count must be positive")
+    rng = np.random.default_rng(seed)
+    labels = np.tile(np.arange(len(CLASSES)), count // len(CLASSES) + 1)[:count]
+    rng.shuffle(labels)
+
+    size = config.size
+    latents: list[Latent] = []
+    for label in labels:
+        radius = float(rng.uniform(config.min_object, config.max_object)) * size / 2.0
+        margin = radius * 1.05 + 1.0
+        latents.append(
+            Latent(
+                label=int(label),
+                radius=radius,
+                centre=(
+                    float(rng.uniform(margin, size - margin)),
+                    float(rng.uniform(margin, size - margin)),
+                ),
+                angle=float(rng.uniform(0.0, 2.0 * np.pi)),
+                colour=int(rng.integers(len(PALETTE))),
+                noise_seed=int(rng.integers(0, 2**31 - 1)),
+            )
+        )
+    return latents
+
+
+def assign_cues(
+    labels: np.ndarray, cue_mode: str, config: ImageConfig, seed: int
+) -> np.ndarray:
+    """Which class the background tint names, per image.
+
+    In ``aligned`` mode a disagreeing tint is drawn uniformly from the *other* classes, so the
+    realised agreement rate is ``cue_strength`` rather than ``cue_strength + noise``.
+    """
+    if cue_mode not in CUE_MODES:
+        raise ValueError(f"unknown cue mode {cue_mode!r}; expected one of {CUE_MODES}")
+    labels = np.asarray(labels, dtype=np.int64)
+    n_classes = len(CLASSES)
+    if cue_mode == "inverted":
+        return ((labels + 1) % n_classes).astype(np.int64)
+
+    rng = np.random.default_rng(seed)
+    if cue_mode == "random":
+        return rng.integers(n_classes, size=len(labels)).astype(np.int64)
+    keep = rng.random(len(labels)) < config.cue_strength
+    offsets = rng.integers(1, n_classes, size=len(labels))
+    return np.where(keep, labels, (labels + offsets) % n_classes).astype(np.int64)
 
 
 def render(
-    label: int, cue_label: int, rng: np.random.Generator, config: ImageConfig
+    latent: Latent, cue_label: int, config: ImageConfig
 ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
-    """One image: tinted background, one shape, gaussian noise."""
+    """One image: tinted background, one shape, gaussian noise.
+
+    Pure in ``(latent, cue_label, config)`` - no shared random state - which is what lets two
+    regimes render byte-identical images whenever their tints happen to agree.
+    """
+    if not 0 <= cue_label < len(CLASSES):
+        raise ValueError(f"cue_label must index a class in [0, {len(CLASSES)})")
     size = config.size
     background = np.full(
         (3, size, size), config.background_level, dtype=np.float32
     ) + config.cue_contrast * CUE_TINTS[cue_label][:, None, None]
 
-    radius = float(rng.uniform(config.min_object, config.max_object)) * size / 2.0
-    margin = radius * 1.05 + 1.0
-    centre = (
-        float(rng.uniform(margin, size - margin)),
-        float(rng.uniform(margin, size - margin)),
-    )
-    angle = float(rng.uniform(0.0, 2.0 * np.pi))
-    mask = shape_mask(CLASSES[label], size, radius, centre, angle)
+    mask = shape_mask(CLASSES[latent.label], size, latent.radius, latent.centre, latent.angle)
     if not mask.any():  # pragma: no cover - the margin makes this unreachable
         raise ValueError("empty shape mask")
 
-    colour = PALETTE[int(rng.integers(len(PALETTE)))]
+    colour = PALETTE[latent.colour]
     # keep the shape visible against the tinted background whatever colour was drawn
     if abs(float(colour.mean()) - config.background_level) < 0.25:
         colour = PALETTE[0] if config.background_level < 0.5 else PALETTE[1]
@@ -206,56 +273,66 @@ def render(
     image = background.copy()
     image[:, mask] = colour[:, None]
     if config.noise_std > 0:
-        image = image + rng.normal(0.0, config.noise_std, size=image.shape).astype(np.float32)
+        noise = np.random.default_rng(latent.noise_seed).normal(
+            0.0, config.noise_std, size=image.shape
+        )
+        image = image + noise.astype(np.float32)
     return np.clip(image, 0.0, 1.0).astype(np.float32), _bounding_box(mask)
 
 
 def generate(
-    count: int, cue_mode: str, config: ImageConfig, seed: int, name: str = "split"
+    count: int,
+    cue_mode: str,
+    config: ImageConfig,
+    seed: int,
+    name: str = "split",
+    latents: list[Latent] | None = None,
 ) -> Batch:
-    """Generate one split.  Class labels are balanced by construction."""
+    """Generate one split.  Pass ``latents`` to re-render an existing split under a new cue."""
     config.validate()
     if cue_mode not in CUE_MODES:
         raise ValueError(f"unknown cue mode {cue_mode!r}; expected one of {CUE_MODES}")
     if count < 1:
         raise ValueError("count must be positive")
+    if latents is None:
+        latents = sample_latents(count, config, seed)
+    elif len(latents) != count:
+        raise ValueError("the supplied latents do not match the requested count")
 
-    rng = np.random.default_rng(seed)
-    labels = np.tile(np.arange(len(CLASSES)), count // len(CLASSES) + 1)[:count]
-    rng.shuffle(labels)
+    labels = np.array([latent.label for latent in latents], dtype=np.int64)
+    # a separate stream for the cue: paired splits share latents but must not share tints
+    cues = assign_cues(labels, cue_mode, config, seed + 9_973)
 
     images = np.empty((count, 3, config.size, config.size), dtype=np.float32)
     boxes = np.empty((count, 4), dtype=np.int64)
-    cues = np.empty(count, dtype=np.int64)
-    for index, label in enumerate(labels):
-        cue = _cue_for(int(label), cue_mode, rng, config)
-        images[index], box = render(int(label), cue, rng, config)
+    for index, latent in enumerate(latents):
+        images[index], box = render(latent, int(cues[index]), config)
         boxes[index] = box
-        cues[index] = cue
-    return Batch(
-        images=images, labels=labels.astype(np.int64), boxes=boxes, cue_labels=cues, name=name
-    )
+    return Batch(images=images, labels=labels, boxes=boxes, cue_labels=cues, name=name)
 
 
 def build_dataset(config: ImageConfig | None = None) -> dict[str, Batch]:
     """Train, validation and the three test regimes.
 
-    Each split gets its own seed stream, so no image can appear in two of them.  The three
-    test sets differ *only* in the background cue, which is what isolates the shortcut: any
-    accuracy gap between them is caused by the cue and nothing else.
+    Train, val and test draw independent latents, so no image can appear in two of them.  The
+    three *test* regimes deliberately share one set of latents and differ only in the
+    background cue: any accuracy gap between them is caused by the cue and nothing else.
     """
     settings = config or ImageConfig()
     settings.validate()
     base = settings.seed
+    test_latents = sample_latents(settings.n_test, settings, base + 2)
     return {
         "train": generate(settings.n_train, "aligned", settings, base, "train"),
         "val": generate(settings.n_val, "aligned", settings, base + 1, "val"),
-        "test": generate(settings.n_test, "aligned", settings, base + 2, "test"),
+        "test": generate(
+            settings.n_test, "aligned", settings, base + 2, "test", test_latents
+        ),
         "test_cue_broken": generate(
-            settings.n_test, "random", settings, base + 3, "test_cue_broken"
+            settings.n_test, "random", settings, base + 3, "test_cue_broken", test_latents
         ),
         "test_cue_inverted": generate(
-            settings.n_test, "inverted", settings, base + 4, "test_cue_inverted"
+            settings.n_test, "inverted", settings, base + 4, "test_cue_inverted", test_latents
         ),
     }
 

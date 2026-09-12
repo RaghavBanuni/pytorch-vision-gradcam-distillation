@@ -1,9 +1,9 @@
 """Tests for the generator.
 
-The two properties the whole project rests on are asserted here: the cue really is correlated
-with the label in the training regime (and really is inverted in the OOD regime), and the
-bounding box really does contain the object - otherwise the Grad-CAM pointing score would be
-measuring nothing.
+The properties the whole project rests on are asserted here: the cue really is correlated with
+the label in the training regime (and really is inverted in the OOD regime), the three test
+regimes really are paired so that only the cue differs, and the bounding box really does
+contain the object - otherwise the Grad-CAM pointing score would be measuring nothing.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from visionlab.data import (
     build_dataset,
     describe,
     generate,
+    render,
+    sample_latents,
     shape_mask,
 )
 
@@ -27,6 +29,19 @@ def test_generation_is_reproducible(config):
     assert np.array_equal(first.images, second.images)
     assert np.array_equal(first.labels, second.labels)
     assert np.array_equal(first.boxes, second.boxes)
+    assert np.array_equal(first.cue_labels, second.cue_labels)
+
+
+def test_rendering_is_a_pure_function_of_the_latent(config):
+    """No shared random state - this is what makes the paired regimes possible."""
+    latent = sample_latents(16, config, seed=1)[0]
+    first, box_a = render(latent, 2, config)
+    second, box_b = render(latent, 2, config)
+    assert np.array_equal(first, second)
+    assert box_a == box_b
+    tinted, box_c = render(latent, 3, config)
+    assert not np.array_equal(first, tinted)
+    assert box_c == box_a  # the object did not move, only the background changed
 
 
 def test_images_are_valid_tensors(datasets, config):
@@ -57,6 +72,14 @@ def test_the_cue_is_systematically_wrong_when_inverted(datasets):
     assert datasets["test_cue_inverted"].cue_agreement == 0.0
 
 
+def test_a_disagreeing_tint_is_never_the_true_label(datasets):
+    """In aligned mode the realised agreement must equal cue_strength, not exceed it."""
+    batch = datasets["train"]
+    disagreeing = batch.cue_labels[batch.cue_labels != batch.labels]
+    assert len(disagreeing) > 0
+    assert len(np.unique(disagreeing)) > 1  # spread over the other classes, not a single one
+
+
 def test_boxes_lie_inside_the_frame(datasets, config):
     for batch in datasets.values():
         x0, y0, x1, y1 = (batch.boxes[:, index] for index in range(4))
@@ -80,22 +103,39 @@ def test_the_object_is_actually_inside_its_box(datasets):
         assert x0 <= x <= x1 and y0 <= y <= y1, index
 
 
-def test_splits_share_no_images(datasets):
+def test_train_val_and_test_share_no_images(datasets):
     seen: set[bytes] = set()
-    for batch in datasets.values():
+    for name in ("train", "val", "test"):
+        batch = datasets[name]
         digests = {batch.images[index].tobytes() for index in range(len(batch))}
-        assert not (digests & seen)
+        assert not (digests & seen), name
         seen |= digests
 
 
-def test_the_three_test_regimes_differ_only_in_the_cue(datasets):
-    sizes = {name: len(batch) for name, batch in datasets.items() if name.startswith("test")}
-    assert len(set(sizes.values())) == 1
+def test_the_three_test_regimes_are_paired(datasets):
+    """Same objects, same noise; only the tint differs.
+
+    Where two regimes happen to draw the same tint the images must be byte-identical, and where
+    the tints differ the images must differ.  Without this pairing, an accuracy gap between the
+    regimes would confound the cue with ordinary sampling noise.
+    """
+    reference = datasets["test"]
     for name in ("test_cue_broken", "test_cue_inverted"):
-        assert np.array_equal(
-            np.bincount(datasets[name].labels, minlength=len(CLASSES)),
-            np.bincount(datasets["test"].labels, minlength=len(CLASSES)),
-        )
+        other = datasets[name]
+        assert np.array_equal(other.labels, reference.labels)
+        assert np.array_equal(other.boxes, reference.boxes)
+        same_tint = other.cue_labels == reference.cue_labels
+        assert same_tint.any() or name == "test_cue_inverted"
+        for index in np.flatnonzero(same_tint)[:5]:
+            assert np.array_equal(other.images[index], reference.images[index])
+        for index in np.flatnonzero(~same_tint)[:5]:
+            assert not np.array_equal(other.images[index], reference.images[index])
+
+
+def test_supplied_latents_must_match_the_count(config):
+    latents = sample_latents(32, config, seed=2)
+    with pytest.raises(ValueError, match="do not match the requested count"):
+        generate(16, "aligned", config, seed=2, latents=latents)
 
 
 @pytest.mark.parametrize(
@@ -162,3 +202,9 @@ def test_configuration_is_validated():
 def test_unknown_cue_mode_is_rejected(config):
     with pytest.raises(ValueError, match="unknown cue mode"):
         generate(32, "shuffled", config, seed=1)
+
+
+def test_render_rejects_a_cue_outside_the_class_range(config):
+    latent = sample_latents(16, config, seed=4)[0]
+    with pytest.raises(ValueError, match="cue_label must index a class"):
+        render(latent, len(CLASSES), config)

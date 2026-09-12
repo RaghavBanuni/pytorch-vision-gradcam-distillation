@@ -15,7 +15,7 @@ generator (shape + position + bbox + background cue)
         +--> train / val / test        cue agrees with the label  (p = 0.95)
         +--> test_cue_broken           cue randomised
         +--> test_cue_inverted         cue points at the wrong class
-        |
+        |                              (all three rendered from the SAME objects)
         v
 train: SmallResNet, cosine schedule, label smoothing, early stopping
         |
@@ -50,11 +50,17 @@ The point of reporting both is that they cost different things, and neither is f
 split. That is exactly why a single held-out number is not evidence of generalisation, and
 why the harness always evaluates three test sets.
 
+**The three test regimes are a paired comparison.** They are rendered from the same latent
+objects - same shapes, positions, rotations, colours, even the same noise draw - and differ
+*only* in the background tint. Sampling them independently would confound the cue with
+ordinary sampling noise; pairing them means the gap has exactly one cause.
+
 **Grad-CAM is scored, not admired.** Every generated image knows where its object is, so the
 class activation map gets two numbers: the *pointing game* hit-rate (does the peak of the map
-fall inside the object box?) and *mask energy inside the box* as a share of total energy.
-Grad-CAM screenshots in a notebook prove nothing; a pointing-game score of 0.31 versus 0.88
-is an argument.
+fall inside the object box?) and *mask energy inside the box* as a share of total energy. Both
+are reported against the share of the frame the box occupies, which is the score a uniform map
+would get. Grad-CAM screenshots in a notebook prove nothing; a pointing-game score of 0.31
+against a 0.14 baseline is an argument.
 
 **Confidence is checked, not assumed.** A model can be accurate and still badly calibrated,
 which matters the moment a downstream system thresholds on the probability. Expected
@@ -69,7 +75,7 @@ and the accuracy gap on all three test sets, are reported together.
 
 ```
 visionlab/
-  data.py        procedural images: shapes, boxes, background cue, three test regimes
+  data.py        procedural images: shapes, boxes, background cue, paired test regimes
   augment.py     tensor augmentations, including the cue-breaking ones
   models.py      SmallResNet, TinyCNN student, torchvision backbone adapter, freezing
   train.py       Trainer: seeding, warmup + cosine, label smoothing, early stopping
@@ -88,7 +94,7 @@ pip install -r requirements.txt
 python -m visionlab.cli data                  # generate and describe the three regimes
 python -m visionlab.cli train --epochs 8      # train and report all metrics
 python -m visionlab.cli explain               # Grad-CAM pointing game, per class
-python -m visionlab.cli robustness            # shortcut gap, with and without the fix
+python -m visionlab.cli robustness --balanced # shortcut gap, with and without the fixes
 python -m visionlab.cli distill               # teacher -> student, against a scratch student
 
 pytest -q
@@ -96,7 +102,7 @@ pytest -q
 
 Everything runs on CPU in minutes at the default 48x48 resolution; `--device cuda` is honoured
 when available. Pretrained torchvision weights are supported through
-`--backbone resnet18 --pretrained`, which downloads them - the default is a self-contained
+`--model resnet18 --pretrained`, which downloads them - the default is a self-contained
 architecture so nothing here depends on a network call.
 
 ## Honest limitations

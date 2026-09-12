@@ -1,0 +1,6 @@
+numpy>=1.24
+pandas>=2.0
+torch>=2.1
+pytest>=7.4
+# optional: only needed for --backbone resnet18 / --pretrained
+# torchvision>=0.16

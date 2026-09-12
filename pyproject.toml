@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visionlab"
+version = "0.1.0"
+description = "Shortcut learning, scored Grad-CAM and knowledge distillation in PyTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+backbones = ["torchvision>=0.16"]
+
+[project.scripts]
+visionlab = "visionlab.cli:main"
+
+[tool.setuptools]
+packages = ["visionlab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
